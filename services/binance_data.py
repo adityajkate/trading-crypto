@@ -12,6 +12,39 @@ class BinanceData:
         self.valid_symbols = None
         self.last_fetch_time = {}
 
+    def exchange_info(self):
+        """Wrapper for ExchangeValidator compatibility"""
+        endpoint = f"{self.base_url}/api/v3/exchangeInfo"
+        try:
+            response = requests.get(endpoint, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            market_logger.error(f"Failed to get exchange info: {e}")
+            return None
+
+    def ping(self):
+        """Ping endpoint for health checks"""
+        endpoint = f"{self.base_url}/api/v3/ping"
+        try:
+            response = requests.get(endpoint, timeout=5)
+            response.raise_for_status()
+            return {}
+        except requests.exceptions.RequestException as e:
+            market_logger.error(f"Ping failed: {e}")
+            raise
+
+    def time(self):
+        """Get server time"""
+        endpoint = f"{self.base_url}/api/v3/time"
+        try:
+            response = requests.get(endpoint, timeout=5)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            market_logger.error(f"Time fetch failed: {e}")
+            raise
+
     def test_connection(self):
         """Test API connection and get server time"""
         endpoint = f"{self.base_url}/api/v3/time"

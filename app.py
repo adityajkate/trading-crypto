@@ -8,8 +8,13 @@ import streamlit as st
 import config
 from services.binance_data import BinanceData
 from services.binance_trade import BinanceTrade
+from services.bot_state import BotStateManager
+from services.exchange_validator import ExchangeValidator
+from services.health_monitor import HealthMonitor
 from services.logger import execution_logger, strategy_logger
+from services.order_engine import OrderStateEngine
 from services.position_manager import PositionManager
+from services.websocket_manager import BinanceWebSocketManager
 from strategy.indicators import calculate_indicators, is_ready
 from strategy.risk import calculate_position_size, validate_trade
 from strategy.signals import (
@@ -23,12 +28,16 @@ st.set_page_config(page_title="Crypto Trading Bot", layout="wide")
 # Initialize session state
 if "bot_running" not in st.session_state:
     st.session_state.bot_running = False
-if "trades" not in st.session_state:
-    st.session_state.trades = []
 if "connection_status" not in st.session_state:
     st.session_state.connection_status = None
 if "auth_status" not in st.session_state:
     st.session_state.auth_status = None
+if "state_manager" not in st.session_state:
+    st.session_state.state_manager = BotStateManager(config.DB_PATH)
+if "health_monitor" not in st.session_state:
+    st.session_state.health_monitor = HealthMonitor()
+if "ws_manager" not in st.session_state:
+    st.session_state.ws_manager = None
 
 
 def get_secret(name):
@@ -119,7 +128,13 @@ st.title("Crypto Trading Bot - Spot Long Only")
 # Sidebar controls
 st.sidebar.header("Settings")
 
-demo_mode = st.sidebar.checkbox("Demo Mode (Testnet)", value=True)
+bot_mode = st.sidebar.selectbox(
+    "Bot Mode",
+    ["DEMO", "TESTNET", "LIVE"],
+    index=0 if config.START_IN_DEMO else 1
+)
+demo_mode = bot_mode in ["DEMO", "TESTNET"]
+
 selected_symbol = st.sidebar.selectbox("Symbol", config.SYMBOLS)
 risk_per_trade = st.sidebar.number_input(
     "Risk per trade (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5
@@ -138,6 +153,12 @@ except Exception as e:
 # Initialize services
 data_service = BinanceData(demo_mode=demo_mode)
 position_manager = PositionManager()
+state_manager = st.session_state.state_manager
+health_monitor = st.session_state.health_monitor
+
+# Initialize validator and order engine
+validator = ExchangeValidator(data_service)
+order_engine = OrderStateEngine(trade_service if not demo_mode else None, state_manager)
 
 # Connection health panel
 st.sidebar.markdown("---")
@@ -145,9 +166,14 @@ st.sidebar.subheader("Connection Health")
 
 if st.sidebar.button("Test Connection"):
     with st.spinner("Testing connection..."):
-        conn_ok, server_time = data_service.test_connection()
-        st.session_state.connection_status = "Connected" if conn_ok else "Failed"
+        # API connectivity
+        api_health = health_monitor.check_api_connectivity(data_service)
+        st.session_state.connection_status = "Connected" if api_health['status'] == 'OK' else "Failed"
 
+        # Server time sync
+        time_health = health_monitor.check_server_time(data_service)
+
+        # Auth check
         auth_ok, auth_msg = trade_service.test_auth()
         if auth_ok:
             if demo_mode and not trade_service.demo_mode:
@@ -180,9 +206,13 @@ if st.sidebar.button("Test Connection"):
         else:
             st.session_state.auth_status = auth_msg
 
+        # Log health
+        state_manager.log_health('api', api_health['status'], str(api_health.get('latency_ms')))
+        state_manager.log_health('server_time', time_health['status'], str(time_health.get('offset_ms')))
+
 format_status("API", st.session_state.connection_status)
 format_status("Auth", st.session_state.auth_status)
-st.sidebar.write(f"**Mode:** {'[DEMO] Testnet' if demo_mode else '[LIVE] Live'}")
+st.sidebar.write(f"**Mode:** {'[DEMO]' if bot_mode == 'DEMO' else '[TESTNET]' if bot_mode == 'TESTNET' else '[LIVE]'} {bot_mode}")
 
 # Bot control
 st.sidebar.markdown("---")
@@ -198,15 +228,25 @@ st.sidebar.markdown(
     f"**Status:** {'[RUNNING] Running' if st.session_state.bot_running else '[STOPPED] Stopped'}"
 )
 
-# Fetch data (no cache for live data)
-df = data_service.get_klines(selected_symbol, config.TIMEFRAME, config.KLINES_LIMIT)
+# Fetch data with caching
+@st.cache_data(ttl=60)
+def fetch_klines(symbol, timeframe, limit, demo):
+    service = BinanceData(demo_mode=demo)
+    return service.get_klines(symbol, timeframe, limit)
+
+df = fetch_klines(selected_symbol, config.TIMEFRAME, config.KLINES_LIMIT, demo_mode)
 
 if df is None:
     st.error("Failed to fetch market data. Check connection.")
     st.stop()
 
-# Calculate indicators
-df_with_indicators = calculate_indicators(df)
+# Calculate indicators with caching
+@st.cache_data(ttl=60)
+def compute_indicators(df_json):
+    df = pd.read_json(df_json)
+    return calculate_indicators(df)
+
+df_with_indicators = compute_indicators(df.to_json())
 
 if df_with_indicators is None:
     st.error("Not enough data for indicators")
@@ -241,8 +281,9 @@ col3.metric("ADX", f"{current_adx:.1f}")
 # Signal status
 st.subheader("Signal Status")
 
-# Load current position
-current_position = position_manager.load_position()
+# Load current position from database
+open_positions = state_manager.get_open_positions()
+current_position = open_positions[0] if open_positions else None
 
 if signal:
     st.success(f"LONG SIGNAL - {reason}")
@@ -274,23 +315,44 @@ if signal:
     ):
         valid, msg = validate_trade(selected_symbol, position_size, current_price)
         if valid:
-            st.info("Paper trade executed")
+            # Validate with exchange filters
+            validation_result = validator.validate_order(
+                selected_symbol,
+                position_size,
+                current_price
+            )
 
-            new_position = {
-                "symbol": selected_symbol,
-                "entry_price": current_price,
-                "quantity": position_size,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "entry_time": datetime.now().isoformat(),
-                "signal_id": signal_id,
-            }
+            if validation_result['valid']:
+                st.info("Paper trade executed")
 
-            position_manager.save_position(new_position)
-            position_manager.mark_signal_executed(signal_id)
-            execution_logger.info(f"Position opened: {new_position}")
+                position_id = state_manager.open_position(
+                    symbol=selected_symbol,
+                    side='BUY',
+                    entry_price=current_price,
+                    quantity=position_size,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    metadata={'signal_id': signal_id}
+                )
 
-            st.rerun()
+                state_manager.record_signal(
+                    symbol=selected_symbol,
+                    signal_type='LONG',
+                    price=current_price,
+                    indicators={
+                        'rsi': float(current_rsi),
+                        'adx': float(current_adx),
+                        'atr': float(current_atr)
+                    },
+                    confidence=100.0
+                )
+
+                position_manager.mark_signal_executed(signal_id)
+                execution_logger.info(f"Position opened: ID={position_id}")
+
+                st.rerun()
+            else:
+                st.warning(f"Exchange validation failed: {validation_result['reason']}")
         else:
             st.warning(f"Trade validation failed: {msg}")
     elif position_manager.is_signal_executed(signal_id):
@@ -317,18 +379,21 @@ if current_position:
     if current_price <= pos["stop_loss"]:
         st.error("Stop loss hit!")
 
-        trade_record = {
-            "symbol": pos["symbol"],
-            "entry": entry_price,
-            "exit": current_price,
-            "quantity": quantity,
-            "pnl": pnl,
-            "exit_reason": "Stop Loss",
-            "exit_time": datetime.now().isoformat(),
-        }
+        pnl_final = (current_price - entry_price) * quantity
 
-        st.session_state.trades.append(trade_record)
-        execution_logger.info(f"Position closed (SL): {trade_record}")
+        state_manager.close_position(pos['id'], pnl=pnl_final)
+        state_manager.record_trade(
+            symbol=pos['symbol'],
+            side='SELL',
+            order_type='MARKET',
+            price=current_price,
+            quantity=quantity,
+            status='FILLED',
+            position_id=pos['id'],
+            metadata={'exit_reason': 'Stop Loss'}
+        )
+
+        execution_logger.info(f"Position closed (SL): ID={pos['id']}, PnL={pnl_final}")
 
         position_manager.clear_position()
         time.sleep(1)
@@ -337,18 +402,21 @@ if current_position:
     elif current_price >= pos["take_profit"]:
         st.success("Take profit hit!")
 
-        trade_record = {
-            "symbol": pos["symbol"],
-            "entry": entry_price,
-            "exit": current_price,
-            "quantity": quantity,
-            "pnl": pnl,
-            "exit_reason": "Take Profit",
-            "exit_time": datetime.now().isoformat(),
-        }
+        pnl_final = (current_price - entry_price) * quantity
 
-        st.session_state.trades.append(trade_record)
-        execution_logger.info(f"Position closed (TP): {trade_record}")
+        state_manager.close_position(pos['id'], pnl=pnl_final)
+        state_manager.record_trade(
+            symbol=pos['symbol'],
+            side='SELL',
+            order_type='MARKET',
+            price=current_price,
+            quantity=quantity,
+            status='FILLED',
+            position_id=pos['id'],
+            metadata={'exit_reason': 'Take Profit'}
+        )
+
+        execution_logger.info(f"Position closed (TP): ID={pos['id']}, PnL={pnl_final}")
 
         position_manager.clear_position()
         time.sleep(1)
@@ -356,80 +424,133 @@ if current_position:
 else:
     st.write("No open position")
 
-# Chart
+# Chart with fragment for live updates
+@st.fragment(run_every=3)
+def render_chart():
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df_with_indicators["timestamp"],
+            open=df_with_indicators["open"],
+            high=df_with_indicators["high"],
+            low=df_with_indicators["low"],
+            close=df_with_indicators["close"],
+            name="Price",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_with_indicators["timestamp"],
+            y=df_with_indicators["ema_50"],
+            name="EMA 50",
+            line=dict(color="blue", width=1),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_with_indicators["timestamp"],
+            y=df_with_indicators["ema_200"],
+            name="EMA 200",
+            line=dict(color="red", width=1),
+        )
+    )
+
+    fig.update_layout(
+        xaxis_title="Time",
+        yaxis_title="Price (USDT)",
+        height=500,
+        xaxis_rangeslider_visible=False,
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 st.subheader("Price Chart")
-fig = go.Figure()
+render_chart()
 
-fig.add_trace(
-    go.Candlestick(
-        x=df_with_indicators["timestamp"],
-        open=df_with_indicators["open"],
-        high=df_with_indicators["high"],
-        low=df_with_indicators["low"],
-        close=df_with_indicators["close"],
-        name="Price",
-    )
-)
-
-fig.add_trace(
-    go.Scatter(
-        x=df_with_indicators["timestamp"],
-        y=df_with_indicators["ema_50"],
-        name="EMA 50",
-        line=dict(color="blue", width=1),
-    )
-)
-
-fig.add_trace(
-    go.Scatter(
-        x=df_with_indicators["timestamp"],
-        y=df_with_indicators["ema_200"],
-        name="EMA 200",
-        line=dict(color="red", width=1),
-    )
-)
-
-fig.update_layout(
-    xaxis_title="Time",
-    yaxis_title="Price (USDT)",
-    height=500,
-    xaxis_rangeslider_visible=False,
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# Trade log
+# Trade log from database
 st.subheader("Trade Log")
-if st.session_state.trades:
-    trades_df = pd.DataFrame(st.session_state.trades)
-    st.dataframe(trades_df, use_container_width=True)
+trades = state_manager.get_trade_history(limit=100)
 
-    total_pnl = trades_df["pnl"].sum()
-    win_rate = (
-        (trades_df["pnl"] > 0).sum() / len(trades_df) * 100
-        if len(trades_df) > 0
-        else 0
-    )
+if trades:
+    trades_df = pd.DataFrame(trades)
 
-    winning_trades = trades_df[trades_df["pnl"] > 0]
-    losing_trades = trades_df[trades_df["pnl"] < 0]
+    # Calculate PnL from trades
+    closed_positions = {}
+    for trade in trades:
+        pos_id = trade.get('position_id')
+        if pos_id:
+            if pos_id not in closed_positions:
+                closed_positions[pos_id] = {'entry': None, 'exit': None, 'quantity': 0}
 
-    avg_win = winning_trades["pnl"].mean() if len(winning_trades) > 0 else 0
-    avg_loss = losing_trades["pnl"].mean() if len(losing_trades) > 0 else 0
+            if trade['side'] == 'BUY':
+                closed_positions[pos_id]['entry'] = trade['price']
+                closed_positions[pos_id]['quantity'] = trade['quantity']
+            elif trade['side'] == 'SELL':
+                closed_positions[pos_id]['exit'] = trade['price']
 
-    profit_factor = (
-        abs(winning_trades["pnl"].sum() / losing_trades["pnl"].sum())
-        if len(losing_trades) > 0 and losing_trades["pnl"].sum() != 0
-        else 0
-    )
+    # Build display dataframe
+    display_trades = []
+    for pos_id, data in closed_positions.items():
+        if data['entry'] and data['exit']:
+            pnl = (data['exit'] - data['entry']) * data['quantity']
+            display_trades.append({
+                'position_id': pos_id,
+                'entry': data['entry'],
+                'exit': data['exit'],
+                'quantity': data['quantity'],
+                'pnl': pnl
+            })
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total PnL", f"${total_pnl:.2f}")
-    col2.metric("Win Rate", f"{win_rate:.1f}%")
-    col3.metric("Avg Win", f"${avg_win:.2f}")
-    col4.metric("Profit Factor", f"{profit_factor:.2f}")
+    if display_trades:
+        display_df = pd.DataFrame(display_trades)
+        st.dataframe(display_df, use_container_width=True)
+
+        total_pnl = display_df["pnl"].sum()
+        win_rate = (
+            (display_df["pnl"] > 0).sum() / len(display_df) * 100
+            if len(display_df) > 0
+            else 0
+        )
+
+        winning_trades = display_df[display_df["pnl"] > 0]
+        losing_trades = display_df[display_df["pnl"] < 0]
+
+        avg_win = winning_trades["pnl"].mean() if len(winning_trades) > 0 else 0
+        avg_loss = losing_trades["pnl"].mean() if len(losing_trades) > 0 else 0
+
+        profit_factor = (
+            abs(winning_trades["pnl"].sum() / losing_trades["pnl"].sum())
+            if len(losing_trades) > 0 and losing_trades["pnl"].sum() != 0
+            else 0
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total PnL", f"${total_pnl:.2f}")
+        col2.metric("Win Rate", f"{win_rate:.1f}%")
+        col3.metric("Avg Win", f"${avg_win:.2f}")
+        col4.metric("Profit Factor", f"{profit_factor:.2f}")
+    else:
+        st.write("No closed trades yet")
 else:
     st.write("No trades yet")
+
+# Health monitoring panel
+st.sidebar.markdown("---")
+st.sidebar.subheader("System Health")
+
+if st.sidebar.button("Refresh Health"):
+    health_report = health_monitor.get_comprehensive_health(
+        data_service,
+        validator,
+        st.session_state.ws_manager,
+        selected_symbol
+    )
+
+    with st.sidebar.expander("Health Details", expanded=False):
+        st.json(health_report)
 
 # Auto refresh
 if st.session_state.bot_running:
