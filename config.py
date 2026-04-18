@@ -1,0 +1,21 @@
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+TIMEFRAME = "1h"
+DEMO_MODE = True
+
+EMA_FAST = 50
+EMA_SLOW = 200
+ADX_PERIOD = 14
+ADX_THRESHOLD = 20
+RSI_PERIOD = 14
+RSI_BUY_MIN = 40
+RSI_BUY_MAX = 55
+ATR_PERIOD = 14
+ATR_STOP_MULTIPLIER = 1.5
+RISK_REWARD_RATIO = 2.0
+
+BINANCE_SPOT_BASE = "https://api.binance.com"
+BINANCE_TESTNET_BASE = "https://testnet.binance.vision"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443"
+BINANCE_TESTNET_WS_BASE = "wss://testnet.binance.vision"
+
+KLINES_LIMIT = 500
